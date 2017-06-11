@@ -1,0 +1,559 @@
+#include <Wire.h>
+#include <Indio.h>
+#include <SimpleModbusMaster.h>
+#include <UC1701.h>
+static UC1701 lcd;
+
+/*
+ this example uses holding registers:
+ [0-3] sends 4 registers (int) to the slave: status of 4 LEDs = digital outputs of the slave
+ [6-7] reads 2 registers (int) from the slave: status of 2 PUSH BUTTONS = digital inputs of the slave
+ actually we read 4 registers but only 2 are connected to buttons
+ */
+
+//////////////////// Port information ///////////////////
+#define baud 9600  // tested 9600 to 115200
+#define timeout 5000
+#define polling 200 // the scan rate, standard was 200
+#define retry_count 10
+
+// used to toggle the receive/transmit pin on the driver
+#define TxEnablePin 9                                                           // INDUSTRUINO RS485
+#define SlaveID 2
+
+// The total amount of available memory on the master to store data
+#define TOTAL_NO_OF_REGISTERS 8                                          // e.g. INDIO digital I/O
+
+// This is the easiest way to create new packets
+// Add as many as you want. TOTAL_NO_OF_PACKETS
+// is automatically updated.
+enum {
+	PACKET1,                                          // set 4 registers
+	PACKET2,                                          // read 4 registers
+	TOTAL_NO_OF_PACKETS // leave this last entry
+};
+
+// Create an array of Packets to be configured
+Packet packets[TOTAL_NO_OF_PACKETS];
+
+// Masters register array
+unsigned int regs[TOTAL_NO_OF_REGISTERS];
+unsigned long previousMillis;
+unsigned long servoIntervalMillis;
+int modErrorCount = 0;
+signed int telegraphPosition;
+int telegraphTolorance = 2;
+int voltageSensePin = 1;
+float currentVoltage;
+bool telegraphNeutralSwitch;
+int masterIsConnected = 1; // static value is communicated to slave
+int slaveIsConnected = 1; // every modbus update this value is reset
+bool isConnected;
+bool remoteControlled = false;
+
+// ####### Local Telegraph #######
+
+float minLocalTelegraphForwardMeasured = 670;
+float maxLocalTelegraphForwardMeasured = 1330;
+float minLocalTelegraphReverseMeasured = 147;
+float maxLocalTelegraphReverseMeasured = 408;
+float localTelegraphRawMeasurement;
+
+
+int localTelegraphPosition;
+int remoteTelegraphPosition;
+bool localTelegraphNeutralSwitch;
+int remoteTelegraphNeutralSwitch;
+
+int localTelegraphSensorPin = 2;
+int localTelegraphSupplyPin = 2;
+int localTelegraphNeutralSwitchPin = 8;
+
+// ######## Servos ########
+float referenceVoltage = 19;
+
+// Throttle
+bool throttleWorthMoving = false;
+float throttlePosition;
+float throttleTolerance = 5;
+float wantedThrottlePosition;
+int throttleIncreasePin = 3;
+bool throttleIncreasing = 0;
+int throttleDecreasePin = 4;
+bool throttleDecreasing = 0;
+int throttleIncreaseTravelTime = 1900; // Travel time from min to max @ rated voltage accounting for resistance
+float throttleIncreaseTravelPerMilli;
+int throttleDecreaseTravelTime = 1900; // Travel time from max to min @ rated voltage accounting for resistance
+float throttleDecreaseTravelPerMilli;
+int throttleErrorMargin = 500; // Time to hold at max or min to make sure we are in that position
+bool throttleInitialized = false;
+bool throttleActive = false;
+unsigned long throttleStartMillis;
+unsigned long previousThrottleMillis;
+
+// PumpLever
+bool pumpLeverWorthMoving = false;
+float pumpLeverPosition;
+float pumpLeverTolerance = 5;
+float wantedPumpLeverPosition;
+int pumpLeverIncreasePin = 1;
+bool pumpLeverIncreasing = 0;
+int pumpLeverDecreasePin = 2;
+bool pumpLeverDecreasing = 0;
+
+int pumpLeverIncreaseTravelTime = 1900; // Travel time from min to max @ rated voltage accounting for resistance
+float pumpLeverIncreaseTravelPerMilli;
+int pumpLeverDecreaseTravelTime = 1900; // Travel time from max to min @ rated voltage accounting for resistance
+float pumpLeverDecreaseTravelPerMilli;
+int pumpLeverErrorMargin = 500; // Time to hold at max or min to make sure we are in that position
+bool pumpLeverInitialized = false;
+bool pumpLeverActive = false;
+float hundredPercent = 100;
+unsigned long pumpLeverStartMillis;
+unsigned long pumpLeverWantedMillis;
+unsigned long pumpLeverRunMillis = 0;
+unsigned long previousPumpLeverMillis;
+
+void setup() {
+
+	Serial.begin(9600);
+
+	lcd.begin();
+	lcd.clear();
+	lcd.setCursor(12, 0);
+	lcd.print("Engine Controller");
+	lcd.setCursor(0, 3);
+	lcd.print("   INITIALIZING...");
+	analogWrite(26, 100);  // LCD backlight
+
+	Indio.digitalMode(throttleIncreasePin, OUTPUT);
+	Indio.digitalMode(throttleDecreasePin, OUTPUT);
+	Indio.digitalMode(pumpLeverIncreasePin, OUTPUT);
+	Indio.digitalMode(pumpLeverDecreasePin, OUTPUT);
+
+	Indio.setADCResolution(16);
+	Indio.analogReadMode(voltageSensePin, V10);
+
+	// For local Telegraph
+	Indio.analogWriteMode(localTelegraphSupplyPin, V10_raw);
+	Indio.analogReadMode(localTelegraphSensorPin, V10_raw);
+	Indio.digitalMode(localTelegraphNeutralSwitchPin, INPUT);
+
+
+	initThrottlePosition();
+	initPumpLeverPosition();
+
+	// Initialize each packet: packet, slave-id, function, start of slave index, number of regs, start of master index
+	// set 4 registers
+	// read 4 registers
+
+	modbus_construct(&packets[PACKET1], SlaveID, PRESET_MULTIPLE_REGISTERS, 0,
+			4, 0);
+	modbus_construct(&packets[PACKET2], SlaveID, READ_HOLDING_REGISTERS, 4, 4,
+			4);
+
+	// Initialize the Modbus Finite State Machine
+	modbus_configure(&Serial1, baud, SERIAL_8N2, timeout, polling, retry_count,
+	TxEnablePin, packets, TOTAL_NO_OF_PACKETS, regs);
+	// Serial1 = INDUSTRUINO RS485
+	lcd.setCursor(0, 3);
+	lcd.print("                    ");
+}
+
+void loop() {
+
+	currentVoltage = 3.501 * Indio.analogRead(voltageSensePin);
+	pumpLeverIncreaseTravelPerMilli = hundredPercent
+			/ (pumpLeverIncreaseTravelTime / currentVoltage * referenceVoltage);
+	pumpLeverDecreaseTravelPerMilli = hundredPercent
+			/ (pumpLeverDecreaseTravelTime / currentVoltage * referenceVoltage);
+	throttleIncreaseTravelPerMilli = hundredPercent
+			/ (throttleIncreaseTravelTime / currentVoltage * referenceVoltage);
+	throttleDecreaseTravelPerMilli = hundredPercent
+			/ (throttleDecreaseTravelTime / currentVoltage * referenceVoltage);
+
+	Serial.print("variable masterIsConnected before update: ");
+	Serial.print(regs[6]);
+	Serial.println(masterIsConnected);
+	modbus_update();
+
+	remoteTelegraphPosition = (regs[4] - 100);
+	remoteTelegraphNeutralSwitch = regs[5];
+
+	if (remoteControlled) {
+		telegraphPosition = remoteTelegraphPosition;
+		telegraphNeutralSwitch = remoteTelegraphNeutralSwitch;
+	} else {
+		telegraphPosition = localTelegraphPosition;
+		telegraphNeutralSwitch = localTelegraphNeutralSwitch;
+	}
+
+	masterIsConnected = regs[6];
+
+	if ((slaveIsConnected == 1) && (masterIsConnected == 0)){
+			isConnected = true;
+			 slaveIsConnected = masterIsConnected;
+		} else if ((slaveIsConnected == 0) && (masterIsConnected == 1)){
+			isConnected = true;
+			 slaveIsConnected = masterIsConnected;
+		} else {
+			isConnected = false;
+			masterIsConnected = 1;
+			slaveIsConnected = 1;
+		}
+
+	Serial.print("variable masterIsConnected after update: ");
+	Serial.println(masterIsConnected);
+	regs[1] = slaveIsConnected;
+	regs[2] = throttlePosition;
+	regs[3] = pumpLeverPosition;
+
+	if (millis() - servoIntervalMillis > 5) {
+		updatePumpLever();
+		updateThrottle();
+		servoIntervalMillis = millis();
+	}
+
+	// Local Telegraph
+
+	localTelegraphRawMeasurement = Indio.analogRead(localTelegraphSensorPin);
+	localTelegraphNeutralSwitch = Indio.digitalRead(localTelegraphNeutralSwitchPin);
+
+	if (localTelegraphRawMeasurement > minLocalTelegraphForwardMeasured){// && throttleRawMeasurement < maxThrottleForwardMeasured){
+			// We are in forward...
+			localTelegraphPosition = constrain((map(localTelegraphRawMeasurement, minLocalTelegraphForwardMeasured, maxLocalTelegraphForwardMeasured, 0, 100)), 0, 100);
+	//	} else if (throttleRawMeasurement > minThrottleReverseMeasured && throttleRawMeasurement < maxThrottleReverseMeasured){
+		} else if (localTelegraphRawMeasurement < maxLocalTelegraphReverseMeasured){
+			// We are in reverse...
+			localTelegraphPosition = constrain((map(localTelegraphRawMeasurement, minLocalTelegraphReverseMeasured, maxLocalTelegraphReverseMeasured, -100, 0)), -100, 0);
+		} else if (localTelegraphRawMeasurement >= maxLocalTelegraphReverseMeasured && localTelegraphRawMeasurement <= minLocalTelegraphForwardMeasured){
+			// We are in neutral
+			localTelegraphPosition = 0;
+		} else {
+			///Maybe put an error throttle-sensor out of bounds here...
+		}
+
+	if (millis() - previousMillis > 500) {
+		lcd.setCursor(1, 2);
+		lcd.print("Telegraph");
+		lcd.setCursor(65, 2);
+		lcd.print("    ");
+		lcd.setCursor(65, 2);
+		lcd.print(telegraphPosition);
+		lcd.setCursor(100, 2);
+		lcd.println(localTelegraphRawMeasurement);
+
+		lcd.setCursor(1, 3);
+		if (telegraphNeutralSwitch){
+			lcd.print("NeutralSwitch ON ");
+		} else {
+			lcd.print("NeutralSwitch OFF");
+		}
+
+		lcd.setCursor(1, 4);
+		lcd.print("Throttle      ");
+		lcd.setCursor(65, 4);
+		lcd.print(int(throttlePosition));
+		lcd.setCursor(100, 4);
+		lcd.print("%");
+
+		lcd.setCursor(1, 5);
+		lcd.print("PumpLever     ");
+		lcd.setCursor(65, 5);
+		lcd.print(int(pumpLeverPosition));
+		lcd.setCursor(100, 5);
+		lcd.print("%");
+
+		lcd.setCursor(1, 6);
+		lcd.print("Voltage     ");
+		lcd.setCursor(65, 6);
+		lcd.print(currentVoltage);
+		lcd.setCursor(100, 6);
+		lcd.print("v");
+
+		if (telegraphNeutralSwitch){
+			setPosition(50, "pumpLever");
+		} else if (telegraphPosition < -1 && !telegraphNeutralSwitch) {
+			setPosition(0, "pumpLever");
+		} else if (telegraphPosition > 1 && !telegraphNeutralSwitch) {
+			setPosition(100, "pumpLever");
+		}
+
+		if (telegraphPosition < 0){
+			setPosition((telegraphPosition * -1), "throttle");
+		} else {
+			setPosition(telegraphPosition, "throttle");
+		}
+
+		lcd.setCursor(0, 7);
+		lcd.print("Errors: ");
+		lcd.print(modErrorCount);
+		previousMillis = millis();
+
+		lcd.setCursor(0, 1);
+		if (isConnected == 0){
+			lcd.print("NOT CONNECTED");
+		} else {
+			lcd.print("CONNECTED    ");
+		}
+	}
+}
+
+void setPosition(float newPosition, String servo) {
+
+	if (servo == "pumpLever") {
+		float newPumpLeverPosition = newPosition;
+		if ((newPumpLeverPosition > (pumpLeverPosition + telegraphTolorance))
+				|| (newPumpLeverPosition
+						< (pumpLeverPosition - telegraphTolorance))) {
+			pumpLeverWorthMoving = true;
+			wantedPumpLeverPosition = newPumpLeverPosition;
+			if (newPumpLeverPosition == pumpLeverPosition) {
+				pumpLeverActive = false;
+				/*Serial.print("setPosition --> newPumpLeverPosition: ");
+				 Serial.print(newPumpLeverPosition);
+				 Serial.print(" seems the same as pumpLeverPosition: ");
+				 Serial.println(pumpLeverPosition);
+				 Serial.println("setPosition --> setting pumpLeverActive = false ."); */
+			} else if (newPumpLeverPosition
+					> (pumpLeverPosition + pumpLeverTolerance)) {
+				pumpLeverActive = true;
+				Serial.print(
+						"setPosition PumpLever --> newPumpLeverPosition: ");
+				Serial.print(newPumpLeverPosition);
+				Serial.print(" seems bigger then pumpLeverPosition: ");
+				Serial.println(pumpLeverPosition);
+				Serial.println(
+						"setPosition PumpLever --> setting pumpLeverActive = true .");
+			} else if (newPumpLeverPosition
+					< (pumpLeverPosition - pumpLeverTolerance)) {
+				pumpLeverActive = true;
+				Serial.print(
+						"setPosition PumpLever --> newPumpLeverPosition: ");
+				Serial.print(newPumpLeverPosition);
+				Serial.print(" seems smaller then pumpLeverPosition: ");
+				Serial.println(pumpLeverPosition);
+				Serial.println(
+						"setPosition PumpLever --> setting pumpLeverActive = true .");
+			}
+		} else {
+			Serial.println(
+					"setPosition PumpLever--> Lever within telegraphTolorance.");
+			pumpLeverWorthMoving = false;
+		}
+	}
+	if (servo == "throttle") {
+		float newThrottlePosition = newPosition;
+		if ((newThrottlePosition > (throttlePosition + telegraphTolorance))
+				|| (newThrottlePosition
+						< (throttlePosition - telegraphTolorance))) {
+			throttleWorthMoving = true;
+			wantedThrottlePosition = newThrottlePosition;
+			if (newThrottlePosition == throttlePosition) {
+				throttleActive = false;
+				Serial.print("setPosition Throttle --> newThrottlePosition: ");
+				Serial.print(newThrottlePosition);
+				Serial.print(" seems the same as throttlePosition: ");
+				Serial.println(throttlePosition);
+				Serial.println(
+						"setPosition Throttle --> setting throttleActive = false .");
+			} else if (newThrottlePosition
+					> (throttlePosition + throttleTolerance)) {
+				throttleActive = true;
+				Serial.print("setPosition Throttle --> newThrottlePosition: ");
+				Serial.print(newThrottlePosition);
+				Serial.print(" seems bigger then throttlePosition: ");
+				Serial.println(throttlePosition);
+				Serial.println(
+						"setPosition Throttle --> setting throttleActive = true .");
+			} else if (newThrottlePosition
+					< (throttlePosition - throttleTolerance)) {
+				throttleActive = true;
+				Serial.print("setPosition Throttle --> newThrottlePosition: ");
+				Serial.print(newThrottlePosition);
+				Serial.print(" seems smaller then throttlePosition: ");
+				Serial.println(throttlePosition);
+				Serial.println(
+						"setPosition Throttle --> setting throttleActive = true .");
+			}
+		} else {
+			Serial.println(
+					"setPosition Throttle --> Lever within telegraphTolorance.");
+			throttleWorthMoving = false;
+		}
+	}
+}
+
+void updatePumpLever() {
+	if (pumpLeverActive) {
+		lcd.setCursor(115, 5);
+		unsigned long loopRoundTrip = (millis() - previousPumpLeverMillis);
+		if (pumpLeverIncreasing) {
+			Serial.print(
+					"updatePosition --> reads a HIGH on pumpLeverIncreasePin. Increasing position with: ");
+			float pumpLeverIncrement = loopRoundTrip
+					* pumpLeverIncreaseTravelPerMilli;
+			Serial.println(pumpLeverIncrement);
+			Serial.print("updatePosition --> Running time was: ");
+			Serial.println(loopRoundTrip);
+			Serial.print("updatePosition --> @ ");
+			Serial.print(currentVoltage);
+			Serial.print(" v, increment is: ");
+			Serial.println(pumpLeverIncreaseTravelPerMilli);
+			pumpLeverPosition = pumpLeverPosition + pumpLeverIncrement;
+			Serial.print("updatePosition --> Making a new position of: ");
+			Serial.println(pumpLeverPosition);
+
+		} else if (pumpLeverDecreasing) {
+			Serial.print(
+					"updatePosition --> reads a HIGH on pumpLeverDecreasePin. Decreasing position with: ");
+			float pumpLeverDecrement = loopRoundTrip
+					* pumpLeverDecreaseTravelPerMilli;
+			Serial.println(pumpLeverDecrement);
+			Serial.print("updatePosition --> Running time was: ");
+			Serial.println(loopRoundTrip);
+			Serial.print("updatePosition --> @ ");
+			Serial.print(currentVoltage);
+			Serial.print(" v, decrement is: ");
+			Serial.println(pumpLeverDecreaseTravelPerMilli);
+			pumpLeverPosition = pumpLeverPosition - pumpLeverDecrement;
+			Serial.print("updatePosition --> Making a new position of: ");
+			Serial.println(pumpLeverPosition);
+		} else {
+			Serial.println(
+					"updatePosition --> reads a LOW on in- and decrease-pins, not changing position. ");
+		}
+		if ((pumpLeverPosition < (wantedPumpLeverPosition - pumpLeverTolerance))
+				&& pumpLeverWorthMoving) {
+			pumpLeverIncreasing = 1;
+			pumpLeverDecreasing = 0;
+			Indio.digitalWrite(pumpLeverDecreasePin, LOW);
+			Indio.digitalWrite(pumpLeverIncreasePin, HIGH);
+			lcd.print(" +");
+
+		} else if ((pumpLeverPosition
+				> (wantedPumpLeverPosition + pumpLeverTolerance))
+				&& pumpLeverWorthMoving) {
+			pumpLeverIncreasing = 0;
+			pumpLeverDecreasing = 1;
+			Indio.digitalWrite(pumpLeverDecreasePin, HIGH);
+			Indio.digitalWrite(pumpLeverIncreasePin, LOW);
+			lcd.print(" -");
+		} else {
+			lcd.print("OK");
+			pumpLeverActive = false;
+			Serial.print(
+					"updatePosition --> reads a correct position. (wanted = ");
+			Serial.print(wantedPumpLeverPosition);
+			Serial.print(" , actual = ");
+			Serial.print(pumpLeverPosition);
+			Serial.println(
+					") So we are setting pumpleverActive to false and pins to low.");
+			pumpLeverIncreasing = 0;
+			pumpLeverDecreasing = 0;
+			Indio.digitalWrite(pumpLeverDecreasePin, LOW);
+			Indio.digitalWrite(pumpLeverIncreasePin, LOW);
+		}
+	}
+	previousPumpLeverMillis = millis();
+}
+
+void updateThrottle() {
+	if (throttleActive) {
+		lcd.setCursor(115, 4);
+		unsigned long loopRoundTrip = (millis() - previousThrottleMillis);
+		if (throttleIncreasing) {
+			Serial.print(
+					"updatePosition --> reads a HIGH on throttleIncreasePin. Increasing position with: ");
+			float throttleIncrement = loopRoundTrip
+					* throttleIncreaseTravelPerMilli;
+			Serial.println(throttleIncrement);
+			Serial.print("updatePosition --> Running time was: ");
+			Serial.println(loopRoundTrip);
+			Serial.print("updatePosition --> @ ");
+			Serial.print(currentVoltage);
+			Serial.print(" v, increment is: ");
+			Serial.println(throttleIncreaseTravelPerMilli);
+			throttlePosition = throttlePosition + throttleIncrement;
+			Serial.print("updatePosition --> Making a new position of: ");
+			Serial.println(throttlePosition);
+
+		} else if (throttleDecreasing) {
+			Serial.print(
+					"updatePosition --> reads a HIGH on throttleDecreasePin. Decreasing position with: ");
+			float throttleDecrement = loopRoundTrip
+					* throttleDecreaseTravelPerMilli;
+			Serial.println(throttleDecrement);
+			Serial.print("updatePosition --> Running time was: ");
+			Serial.println(loopRoundTrip);
+			Serial.print("updatePosition --> @ ");
+			Serial.print(currentVoltage);
+			Serial.print(" v, decrement is: ");
+			Serial.println(throttleDecreaseTravelPerMilli);
+			throttlePosition = throttlePosition - throttleDecrement;
+			Serial.print("updatePosition --> Making a new position of: ");
+			Serial.println(throttlePosition);
+		} else {
+			Serial.println(
+					"updatePosition --> reads a LOW on in- and decrease-pins, not changing position. ");
+		}
+		if ((throttlePosition < (wantedThrottlePosition - throttleTolerance))
+				&& throttleWorthMoving) {
+			throttleIncreasing = 1;
+			throttleDecreasing = 0;
+			Indio.digitalWrite(throttleDecreasePin, LOW);
+			Indio.digitalWrite(throttleIncreasePin, HIGH);
+			lcd.print(" +");
+
+		} else if ((throttlePosition
+				> (wantedThrottlePosition + throttleTolerance))
+				&& throttleWorthMoving) {
+			throttleIncreasing = 0;
+			throttleDecreasing = 1;
+			Indio.digitalWrite(throttleDecreasePin, HIGH);
+			Indio.digitalWrite(throttleIncreasePin, LOW);
+			lcd.print(" -");
+		} else {
+			lcd.print("OK");
+			throttleActive = false;
+			Serial.print(
+					"updatePosition --> reads a correct position. (wanted = ");
+			Serial.print(wantedThrottlePosition);
+			Serial.print(" , actual = ");
+			Serial.print(throttlePosition);
+			Serial.println(
+					") So we are setting throttleActive to false and pins to low.");
+			throttleIncreasing = 0;
+			throttleDecreasing = 0;
+			Indio.digitalWrite(throttleDecreasePin, LOW);
+			Indio.digitalWrite(throttleIncreasePin, LOW);
+		}
+	}
+	previousThrottleMillis = millis();
+}
+
+void initThrottlePosition() {
+	Indio.digitalWrite(throttleDecreasePin, HIGH);
+	Indio.digitalWrite(throttleIncreasePin, LOW);
+
+	delay(throttleDecreaseTravelTime + throttleErrorMargin);
+
+	Indio.digitalWrite(throttleDecreasePin, LOW);
+	Indio.digitalWrite(throttleIncreasePin, LOW);
+
+	throttleInitialized = true;
+	throttlePosition = 0;
+}
+
+void initPumpLeverPosition() {
+	Indio.digitalWrite(pumpLeverDecreasePin, HIGH);
+	Indio.digitalWrite(pumpLeverIncreasePin, LOW);
+
+	delay(pumpLeverDecreaseTravelTime + pumpLeverErrorMargin);
+
+	Indio.digitalWrite(pumpLeverDecreasePin, LOW);
+	Indio.digitalWrite(pumpLeverIncreasePin, LOW);
+
+	pumpLeverInitialized = true;
+	pumpLeverPosition = 0;
+}
